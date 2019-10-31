@@ -19,9 +19,9 @@
 module.exports = function(RED) {
     "use strict";
     var util = require("util");
-    var requireFromString =  require('require-from-string');
+    var requireFromString = require('require-from-string');
 
-    function sendResults(node,_msgid,msgs) {
+    function sendResults(node,send,_msgid,msgs,cloneFirstMessage) {
         if (msgs === null) {
             return;
         } else if (!Array.isArray(msgs)) {
@@ -37,6 +37,10 @@ module.exports = function(RED) {
                     var msg = msgs[m][n];
                     if (msg !== null && msg !== undefined) {
                         if (typeof msg === 'object' && !Buffer.isBuffer(msg) && !Array.isArray(msg)) {
+                            if (msgCount === 0 && cloneFirstMessage !== false) {
+                                msgs[m][n] = RED.util.cloneMessage(msgs[m][n]);
+                                msg = msgs[m][n];
+                            }
                             msg._msgid = _msgid;
                             msgCount++;
                         } else {
@@ -44,60 +48,14 @@ module.exports = function(RED) {
                             if (type === 'object') {
                                 type = Buffer.isBuffer(msg)?'Buffer':(Array.isArray(msg)?'Array':'Date');
                             }
-                            node.error(RED._("function.error.non-message-returned",{ type: type }))
+                            node.error(RED._("function.error.non-message-returned",{ type: type }));
                         }
                     }
                 }
             }
         }
-        if (msgCount <= 0) {
-          return;
-        }
-        if (RED.settings.nodeRedContribUnsafeFunctionAsyncSend) {
-          // Create empty array of the same length.
-          var emptyArray = msgs.map(function() {
-            return null;
-          });
-          msgs.forEach(function(wireMessages, wireIndex) {
-            if (!wireMessages) {
-              return;
-            }
-            (Array.isArray(wireMessages)?wireMessages:[wireMessages]).forEach(function(msg) {
-              // Fill with a single message.
-              var arr = emptyArray.slice();
-              arr[wireIndex] = [msg];
-              setImmediate(function() {
-                try {
-                  node.send(arr);
-                } catch(err) {
-                  var line = 0;
-                  var errorMessage;
-                  var stack = err.stack.split(/\r?\n/);
-                  if (stack.length > 0) {
-                    while (line < stack.length && stack[line].indexOf("ReferenceError") !== 0) {
-                      line++;
-                    }
-
-                    if (line < stack.length) {
-                      errorMessage = stack[line];
-                      var m = /:(\d+):(\d+)$/.exec(stack[line+1]);
-                      if (m) {
-                        var lineno = Number(m[1])-1;
-                        var cha = m[2];
-                        errorMessage += " (line "+lineno+", col "+cha+")";
-                      }
-                    }
-                  }
-                  if (!errorMessage) {
-                    errorMessage = err.toString();
-                  }
-                  node.error(errorMessage, msg);
-                }
-              });
-            });
-          });
-        } else {
-          node.send(msgs);
+        if (msgCount>0) {
+            send(msgs);
         }
     }
 
@@ -106,8 +64,17 @@ module.exports = function(RED) {
         var node = this;
         this.name = n.name;
         this.func = n.func;
+
+        var handleNodeDoneCall = true;
+        // Check to see if the Function appears to call `node.done()`. If so,
+        // we will assume it is well written and does actually call node.done().
+        // Otherwise, we will call node.done() after the function returns regardless.
+        if (/node\.done\s*\(\s*\)/.test(this.func)) {
+            handleNodeDoneCall = false;
+        }
+
         var functionText = "module.exports = function(util, RED, __node__, context, flow, global, env, setTimeout, clearTimeout, setInterval, clearInterval) { " +
-        "  return function(msg) { " +
+        "  return function(msg,__send__,__done__) { " +
         "    var __msgid__ = msg._msgid;" +
         "    var node = {" +
         "      id:__node__.id," +
@@ -119,7 +86,8 @@ module.exports = function(RED) {
         "      trace:__node__.trace," +
         "      on:__node__.on," +
         "      status:__node__.status," +
-        "      send:function(msgs) { __node__.send(__msgid__,msgs);}" +
+        "      send:function(msgs,cloneMsg) { __node__.send(__send__,__msgid__,msgs,cloneMsg);}," +
+        "      done:__done__"+
         "    };\n" +
         this.func + "\n" +
         "  };" +
@@ -151,8 +119,8 @@ module.exports = function(RED) {
                 trace: function() {
                     node.trace.apply(node, arguments);
                 },
-                send: function(id, msgs) {
-                    sendResults(node, id, msgs);
+                send: function(send, id, msgs, cloneMsg) {
+                    sendResults(node, send, id, msgs, cloneMsg);
                 },
                 on: function() {
                     if (arguments[0] === "input") {
@@ -260,18 +228,77 @@ module.exports = function(RED) {
                 });
             };
         }
-
+        var profiling = {
+          "max": 0,
+          "total": 0,
+          "count": 0,
+          "debounce": null,
+          "status_count": -1 // current count in status message
+        };
         try {
             this.script = requireFromString(functionText)(sandbox.util, sandbox.RED, sandbox.__node__, sandbox.context, sandbox.flow, sandbox.global, sandbox.env, sandbox.setTimeout, sandbox.clearTimeout, sandbox.setInterval, sandbox.clearInterval);
-            if (RED.settings.nodeRedContribUnsafeFunctionAsyncReceive) {
-              this.on("input", function(msg) {
-                setImmediate(function() {
-                  handle(msg);
-                });
-              });
-            } else {
-              this.on("input", handle);
-            }
+            this.on("input", function(msg,send,done) {
+                try {
+                  var start = process.hrtime();
+
+                  var results = node.script(msg, send, done);
+                  sendResults(node, send, msg._msgid, results, false);
+                  if (handleNodeDoneCall) {
+                      done();
+                  }
+
+                  var duration = process.hrtime(start);
+                  var converted = Math.floor((duration[0] * 1e9 + duration[1])/10000)/100;
+                  node.metric("duration", msg, converted);
+                  if (RED.settings.nodeRedContribUnsafeFunctionProfiling) {
+                    profiling.count += 1;
+                    profiling.total += (duration[0] * 1e9 + duration[1]) / 1000000;
+                    profiling.max = Math.max(profiling.max, converted);
+                    if (!profiling.debounce) {
+                      profiling.debounce = setInterval(function() {
+                        if (profiling.status_count == profiling.count) {
+                          // count hasn't changed. stop interval.
+                          clearInterval(profiling.debounce);
+                          profiling.debounce = null;
+                          return;
+                        }
+                        profiling.status_count = profiling.count;
+                        node.status({
+                          fill: "yellow",
+                          shape: "dot",
+                          text: "max: " + profiling.max + ", total: " + (Math.round(profiling.total * 100) / 100) + ", count: " + profiling.count
+                        });
+                      }, 1000); // limited rate for status messages.
+                    }
+                  } else if (process.env.NODE_RED_FUNCTION_TIME) {
+                    node.status({fill:"yellow",shape:"dot",text:""+converted});
+                  }
+                } catch(err) {
+
+                  var line = 0;
+                  var errorMessage;
+                  var stack = err.stack.split(/\r?\n/);
+                  if (stack.length > 0) {
+                    while (line < stack.length && stack[line].indexOf("ReferenceError") !== 0) {
+                      line++;
+                    }
+
+                    if (line < stack.length) {
+                      errorMessage = stack[line];
+                      var m = /:(\d+):(\d+)$/.exec(stack[line+1]);
+                      if (m) {
+                        var lineno = Number(m[1])-1;
+                        var cha = m[2];
+                        errorMessage += " (line "+lineno+", col "+cha+")";
+                      }
+                    }
+                  }
+                  if (!errorMessage) {
+                    errorMessage = err.toString();
+                  }
+                  node.error(errorMessage, msg);
+                }
+            });
             this.on("close", function() {
                 while(node.outstandingTimers.length > 0) {
                     clearTimeout(node.outstandingTimers.pop());
@@ -287,71 +314,6 @@ module.exports = function(RED) {
             this.error(err);
         }
 
-        var profiling = {
-          "max": 0,
-          "total": 0,
-          "count": 0,
-          "debounce": null,
-          "status_count": -1 // current count in status message
-        };
-        function handle(msg) {
-          try {
-            var start = process.hrtime();
-            var results = node.script(msg);
-            sendResults(node, msg._msgid, results);
-
-            var duration = process.hrtime(start);
-            var converted = Math.floor((duration[0] * 1e9 + duration[1])/10000)/100;
-            node.metric("duration", msg, converted);
-            if (RED.settings.nodeRedContribUnsafeFunctionProfiling) {
-              profiling.count += 1;
-              profiling.total += (duration[0] * 1e9 + duration[1]) / 1000000;
-              profiling.max = Math.max(profiling.max, converted);
-              if (!profiling.debounce) {
-                profiling.debounce = setInterval(function() {
-                  if (profiling.status_count == profiling.count) {
-                    // count hasn't changed. stop interval.
-                    clearInterval(profiling.debounce);
-                    profiling.debounce = null;
-                    return;
-                  }
-                  profiling.status_count = profiling.count;
-                  node.status({
-                    fill: "yellow",
-                    shape: "dot",
-                    text: "max: " + profiling.max + ", total: " + (Math.round(profiling.total * 100) / 100) + ", count: " + profiling.count
-                  });
-                }, 1000); // limited rate for status messages.
-              }
-            } else if (process.env.NODE_RED_FUNCTION_TIME) {
-              node.status({fill:"yellow",shape:"dot",text:""+converted});
-            }
-          } catch(err) {
-
-            var line = 0;
-            var errorMessage;
-            var stack = err.stack.split(/\r?\n/);
-            if (stack.length > 0) {
-              while (line < stack.length && stack[line].indexOf("ReferenceError") !== 0) {
-                line++;
-              }
-
-              if (line < stack.length) {
-                errorMessage = stack[line];
-                var m = /:(\d+):(\d+)$/.exec(stack[line+1]);
-                if (m) {
-                  var lineno = Number(m[1])-1;
-                  var cha = m[2];
-                  errorMessage += " (line "+lineno+", col "+cha+")";
-                }
-              }
-            }
-            if (!errorMessage) {
-              errorMessage = err.toString();
-            }
-            node.error(errorMessage, msg);
-          }
-        }
     }
     RED.nodes.registerType("unsafe-function",FunctionNode);
     RED.library.register("functions");

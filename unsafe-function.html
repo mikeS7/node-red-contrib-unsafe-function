@@ -96,7 +96,7 @@
         outputs:1,
         icon: "function.png",
         label: function() {
-            return this.name;
+            return this.name||this._("function.function");
         },
         labelStyle: function() {
             return this.name?"node_label_italic":"";
@@ -104,7 +104,7 @@
         oneditprepare: function() {
             var that = this;
             $( "#node-input-outputs" ).spinner({
-                min:1,
+                min:0,
                 change: function(event, ui) {
                     var value = this.value;
                     if (!value.match(/^\d+$/)) { value = 1;  }
@@ -115,7 +115,7 @@
 
             this.editor = RED.editor.createEditor({
                 id: 'node-input-func-editor',
-                mode: 'ace/mode/javascript',
+                mode: 'ace/mode/nrjavascript',
                 value: $("#node-input-func").val(),
                 globals: {
                     msg:true,
@@ -137,8 +137,9 @@
                 url:"functions", // where to get the data from
                 type:"function", // the type of object the library is for
                 editor:this.editor, // the field name the main text body goes to
-                mode:"ace/mode/javascript",
-                fields:['name','outputs']
+                mode:"ace/mode/nrjavascript",
+                fields:['name','outputs'],
+                ext:"js"
             });
             this.editor.focus();
 
@@ -149,6 +150,7 @@
                     value: value,
                     width: "Infinity",
                     cursor: that.editor.getCursorPosition(),
+                    mode: "ace/mode/nrjavascript",
                     complete: function(v,cursor) {
                         that.editor.setValue(v, -1);
                         that.editor.gotoLine(cursor.row+1,cursor.column,false);
@@ -181,7 +183,7 @@
         oneditresize: function(size) {
             var rows = $("#dialog-form>div:not(.node-text-editor-row)");
             var height = $("#dialog-form").height();
-            for (var i=0;i<rows.size();i++) {
+            for (var i=0; i<rows.length; i++) {
                 height -= $(rows[i]).outerHeight(true);
             }
             var editorRow = $("#dialog-form>div.node-text-editor-row");
