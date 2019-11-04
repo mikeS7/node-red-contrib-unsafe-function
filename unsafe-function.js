@@ -274,29 +274,36 @@ module.exports = function(RED) {
                     node.status({fill:"yellow",shape:"dot",text:""+converted});
                   }
                 } catch(err) {
+                  if ((typeof err === "object") && err.hasOwnProperty("stack")) {
+                    var line = 0;
+                    var errorMessage;
+                    var stack = err.stack.split(/\r?\n/);
+                    if (stack.length > 0) {
+                      while (line < stack.length && stack[line].indexOf("ReferenceError") !== 0) {
+                        line++;
+                      }
 
-                  var line = 0;
-                  var errorMessage;
-                  var stack = err.stack.split(/\r?\n/);
-                  if (stack.length > 0) {
-                    while (line < stack.length && stack[line].indexOf("ReferenceError") !== 0) {
-                      line++;
-                    }
-
-                    if (line < stack.length) {
-                      errorMessage = stack[line];
-                      var m = /:(\d+):(\d+)$/.exec(stack[line+1]);
-                      if (m) {
-                        var lineno = Number(m[1])-1;
-                        var cha = m[2];
-                        errorMessage += " (line "+lineno+", col "+cha+")";
+                      if (line < stack.length) {
+                        errorMessage = stack[line];
+                        var m = /:(\d+):(\d+)$/.exec(stack[line+1]);
+                        if (m) {
+                          var lineno = Number(m[1])-1;
+                          var cha = m[2];
+                          errorMessage += " (line "+lineno+", col "+cha+")";
+                        }
                       }
                     }
+                    if (!errorMessage) {
+                      errorMessage = err.toString();
+                    }
+                    done(errorMessage);
                   }
-                  if (!errorMessage) {
-                    errorMessage = err.toString();
+                  else if (typeof err === "string") {
+                      done(err);
                   }
-                  node.error(errorMessage, msg);
+                  else {
+                      done(JSON.stringify(err));
+                  }
                 }
             });
             this.on("close", function() {
